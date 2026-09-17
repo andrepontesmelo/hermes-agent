@@ -474,6 +474,31 @@ class GatewayTopicThreadsMixin:
             "Discord semantic thread rename",
         )
 
+    def _schedule_telegram_group_title_rename(self, source: SessionSource, session_id: str, title: str) -> None:
+        """Reuse the final persisted title without spending another model call."""
+        self._schedule_rename_from_title_thread(
+            source,
+            lambda copied: self._rename_telegram_group_for_session_title(copied, session_id, title),
+            "Telegram group title rename",
+        )
+
+    async def _rename_telegram_group_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
+        if source.platform != Platform.TELEGRAM or source.chat_type not in {"group", "forum"} or not source.chat_id:
+            return
+        adapter = self._adapter_for_source(source)
+        bot = getattr(adapter, "_bot", None)
+        rename = getattr(bot, "set_chat_title", None)
+        if rename is None:
+            logger.warning("Telegram group title rename unavailable: session=%s", session_id)
+            return
+        try:
+            # Do not sanitize: rejection must not silently diverge from the stored title.
+            applied = await rename(chat_id=int(source.chat_id), title=title)
+            logger.info("Telegram group title rename: session=%s applied=%s", session_id, bool(applied))
+        except Exception as exc:
+            # Transport exceptions may contain credentials or message text; log only the type.
+            logger.warning("Telegram group title rename rejected: session=%s error=%s", session_id, type(exc).__name__)
+
     def _schedule_telegram_topic_title_rename(self, source: SessionSource, session_id: str, title: str) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source) or self._telegram_topic_auto_rename_disabled(source):
