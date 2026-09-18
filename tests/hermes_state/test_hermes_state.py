@@ -1043,18 +1043,27 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+
+        # Trace the seam every read statement flows through (_read_ctx): under
+        # WAL the context query runs on a pooled read-only connection that
+        # changes per checkout, so tracing a fixed connection (the writer or a
+        # one-off _get_read_conn handle) never sees it.
+        real_read_ctx = db._read_ctx
+
+        @contextlib.contextmanager
+        def traced_read_ctx():
+            with real_read_ctx() as conn:
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
             return sum("WITH TARGET AS (" in sql for sql in normalized)
 
-        try:
+        with mock.patch.object(db, "_read_ctx", traced_read_ctx):
             projected = db.search_messages(
                 "projectionneedle", fields=("session_id", "snippet")
             )
@@ -1072,9 +1081,6 @@ class TestFTS5Search:
             assert len(default) == 1
             assert default[0]["context"]
             assert context_query_count() == 2
-        finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
