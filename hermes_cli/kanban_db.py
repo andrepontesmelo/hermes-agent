@@ -112,6 +112,49 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
+def _parked_by_block_loop(block_kind: Optional[str], recurrences: Optional[int]) -> bool:
+    """True when a ``triage`` card is one the unblock-loop breaker parked.
+
+    The single definition of "parked for a human", shared by the two triage
+    promotion paths (:func:`specify_triage_task` and
+    :func:`hermes_cli.kanban_db_graph.decompose_triage_task`) and by the
+    reason their callers report. Both promotion paths MUST honour it:
+    promoting an at-limit card resurrects it, the decomposer then spends an
+    aux LLM call and a full worker run on it every tick, and the loop the
+    breaker exists to stop runs forever (t_5ca79764, 4 cycles).
+
+    Skip-only by design, NOT a latch: ``block_kind``/``block_recurrences``
+    deliberately survive unblock (see :func:`unblock_task`) because clearing
+    them is the amnesia that let this loop grow unbounded. The marker clears
+    itself only through ``complete_task``, or by a human moving the card out
+    of triage.
+    """
+    return block_kind is not None and int(recurrences or 0) >= BLOCK_RECURRENCE_LIMIT
+
+
+def triage_park_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Reason ``task_id`` must not be auto-promoted out of triage, or ``None``
+    when it is not parked (unknown id, not in triage, or below the limit).
+
+    Callers query this BEFORE spending an aux LLM call, so a parked card
+    costs nothing per tick.
+    """
+    row = conn.execute(
+        "SELECT block_kind, block_recurrences FROM tasks WHERE id = ? AND status = 'triage'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    kind = _row_get(row, "block_kind")
+    recurrences = int(_row_get(row, "block_recurrences") or 0)
+    if not _parked_by_block_loop(kind, recurrences):
+        return None
+    return (
+        f"parked in triage by block-loop detection (blocked {recurrences}x as "
+        f"{kind}, limit {BLOCK_RECURRENCE_LIMIT}); awaiting human"
+    )
+
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
     empty/None = inherit the profile's own effort (NULL). Anything else raises —
@@ -3831,16 +3874,27 @@ def specify_triage_task(
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    Refuses (False, no field written, status left ``triage``) when the
+    unblock-loop breaker parked the card for a human — see
+    :func:`_parked_by_block_loop`. Without this guard the decomposer
+    resurrected every at-limit card each tick and defeated
+    ``BLOCK_RECURRENCE_LIMIT`` outright (t_5ca79764).
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, block_kind, block_recurrences "
+            "FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        if _parked_by_block_loop(
+            _row_get(existing, "block_kind"), _row_get(existing, "block_recurrences"),
+        ):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
