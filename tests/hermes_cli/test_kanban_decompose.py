@@ -256,3 +256,36 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_task_reports_block_loop_park_without_calling_the_llm(kanban_home):
+    """AC2 for the auto-decompose path: the park refusal is a visible reason,
+    costs no aux LLM call, and leaves the card in triage (AC1)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs a human", triage=True)
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'capability', block_recurrences = ? WHERE id = ?",
+            (kb.BLOCK_RECURRENCE_LIMIT, tid),
+        )
+
+    payload = jsonlib.dumps({"fanout": True, "tasks": [
+        {"title": "child", "body": "b", "assignee": "orchestrator", "parents": []},
+    ]})
+    patches = _patch_list_profiles(["orchestrator"])
+    with patch("agent.auxiliary_client.call_llm") as mock_fn:
+        mock_fn.return_value = _fake_aux_response(payload)
+        for p in patches:
+            p.start()
+        try:
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+        finally:
+            for p in patches:
+                p.stop()
+
+    assert outcome.ok is False
+    assert "block-loop detection" in outcome.reason
+    assert "awaiting human" in outcome.reason
+    mock_fn.assert_not_called()
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.triage_park_reason(conn, tid) is not None, "still parked, not cleared"
+
+
