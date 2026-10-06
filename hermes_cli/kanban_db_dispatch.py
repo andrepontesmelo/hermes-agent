@@ -25,7 +25,11 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_worker_output import (
+    _error_fingerprint,
+    _worker_final_output,
+    _worker_log_exit_code,
+)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -255,27 +259,6 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
     return ("nonzero_exit", code)
-
-
-_EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
-)
-
-
-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
-    """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
-
-    The durable twin of ``_recent_worker_exits``: written by the worker itself
-    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -908,13 +891,6 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     return reconciled
 
 
-def _error_fingerprint(error_text: str) -> str:
-    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
-    return fp.lower().strip()
-
-
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
 # run, so a protocol violation gets a bounded retry before the breaker trips.
 # The budget is a violation-only STREAK (``_protocol_violation_streak``),
@@ -972,54 +948,6 @@ _PROTOCOL_VIOLATION_ERROR = (
     "a run without a terminal kanban call counts as failed no "
     "matter what it did."
 )
-
-
-# Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
-_LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
-
-
-def _exit_summary_marker() -> str:
-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
-    from agent.i18n import t
-    return t("cli.session.exit_resume_hint")
-
-
-def _log_noise_prefixes() -> tuple[str, ...]:
-    from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
-
-
-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
-    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
-
-    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
-    (``_default_spawn``), so when it exits without a terminal board call the
-    reason is usually sitting there: the model's own explanation of why it could
-    not comply (#88603), or the rendered provider error (#46593). The reap used to
-    discard it in favour of a canned message on every retry. Trims the CLI exit
-    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
-    on a missing/empty log.
-
-    ``board`` must come from the dispatching tick: ambient current-board resolution
-    is wrong for every board but the one the dispatcher thread happens to call
-    "current", so the log would silently not be found.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return ""
-    if not raw:
-        return ""
-    raw = _EXIT_TRAILER_RE.sub("", raw)
-    cut = raw.rfind(_exit_summary_marker())
-    if cut != -1:
-        raw = raw[:cut]
-    lines = []
-    for ln in raw.splitlines():
-        ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_log_noise_prefixes()):
-            lines.append(ln)
-    return " ".join(lines)[-400:]
 
 
 @dataclass
@@ -2099,6 +2027,10 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    # Stamp the lane on the in-memory Task so the spawn routes this run to
+    # the lane's prompt/verbs (review lane: reviewer verdict prompt, not the
+    # implementer ``work kanban task`` queue prompt — t_ae858313).
+    claimed.dispatch_lane = lane
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -2771,7 +2703,20 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    # The queue prompt is the worker's only role signal before kanban_show:
+    # a review-lane claim must read as a verdict on the implementer's
+    # handoff, never as implementation work (an implementer-owned card in
+    # review once spawned the implementer prompt and crash-looped to
+    # gave_up with no reviewer verb ever called — t_ae858313).
+    if task.dispatch_lane == "review":
+        query = (
+            f"review kanban task {task.id}: verify the implementer's handoff "
+            "(kanban_show), then give exactly one verdict — kanban_complete "
+            "(approve), kanban_request_changes (rework), or kanban_block (escalate)"
+        )
+    else:
+        query = f"work kanban task {task.id}"
+    cmd.extend(["chat", "-q", query])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd

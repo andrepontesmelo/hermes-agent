@@ -96,7 +96,7 @@ Durable SQLite-backed board letting multiple profiles/workers collaborate. Users
 <verb>`; dispatcher-spawned workers use a dedicated `kanban_*` toolset so their schema footprint is
 zero outside a kanban task (footprint ladder rung 3).
 
-- **CLI:** `hermes_cli/kanban.py` facade + 14 `kanban_*.py` siblings (`boards`, `db`, `db_connect`,
+- **CLI:** `hermes_cli/kanban.py` facade + 16 `kanban_*.py` siblings (`boards`, `db`, `db_connect`,
   `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
