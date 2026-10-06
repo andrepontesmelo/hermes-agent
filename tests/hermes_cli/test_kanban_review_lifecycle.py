@@ -929,3 +929,135 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# Review-lane dispatch routing (rentcli t_ae858313 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_implementer_owned_review_card_dispatches_as_review_not_implementer(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first ``request_review`` with no ``reviewer`` leaves the implementer
+    as assignee while the card enters ``review``. The review lane must still
+    claim it (``source_status=review``), but the spawn it hands out is a
+    REVIEW run — reviewer-routed prompt/verbs — never a re-run of the
+    implementer.
+
+    Regression: rentcli t_ae858313 (runs 708-711) and friction flags 74 /
+    115 / 117. The unfixed dispatcher claimed the card via
+    ``claim_review_task`` and then spawned ``hermes -p developer chat -q
+    "work kanban task <id>"`` — the implementer profile with the implementer
+    prompt. The worker saw already-done work, exited without a reviewer
+    verdict, and crash-looped to ``gave_up`` (protocol_violation).
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    captured: list[kb.Task] = []
+
+    def spawn(task, workspace, board=None):
+        captured.append(task)
+        return None
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fix detail-pane star button", assignee="developer")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        # The t_ae858313 shape: the implementer requests review without
+        # naming a reviewer, so request_review cannot reassign the card.
+        assert kb.request_review(
+            conn, tid, summary="star button fixed",
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "developer"
+
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert tid in [t[0] for t in result.spawned]
+    assert len(captured) == 1
+    spawned_task = captured[0]
+    # Review-routed, not implementer-routed: the claimed Task must carry the
+    # review lane so the spawn uses reviewer verbs, never the implementer
+    # queue prompt.
+    assert spawned_task.dispatch_lane == "review"
+    assert "sdlc-review" in (spawned_task.skills or [])
+    argv = kbd._worker_argv(spawned_task, "developer", None)
+    assert argv[-1].startswith(f"review kanban task {tid}:")
+    assert "work kanban task" not in argv[-1]
+
+
+def test_review_card_reopened_to_ready_dispatches_as_implementer_again(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legitimate resume path must keep working: a card manually
+    re-opened from review back to ``ready`` re-dispatches as an implementer
+    run (no review lane marker, implementer queue prompt)."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    captured: list[kb.Task] = []
+
+    def spawn(task, workspace, board=None):
+        captured.append(task)
+        return None
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs another pass", assignee="developer")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="work done",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.reopen_review_task(conn, tid) is True
+        reopened = kb.get_task(conn, tid)
+        assert reopened is not None
+        assert reopened.status == "ready"
+
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert tid in [t[0] for t in result.spawned]
+    assert len(captured) == 1
+    reopened_spawn = captured[0]
+    # Implementer routing: not the review lane, and the queue prompt the
+    # dispatcher builds from this Task is the implementer prompt again.
+    assert reopened_spawn.dispatch_lane != "review"
+    argv = kbd._worker_argv(reopened_spawn, "developer", None)
+    assert argv[-1] == f"work kanban task {tid}"
+
+
+def test_worker_context_flags_review_lane_run(kanban_home: Path) -> None:
+    """A run claimed from ``review`` reads as a review of the implementer's
+    handoff in ``build_worker_context``; an implementation run's context
+    carries no reviewer marker."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review routing", assignee="developer")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="work done",
+            expected_run_id=claimed.current_run_id,
+        )
+        # Implementation run (already closed above): no reviewer marker.
+        assert "review lane" not in kb.build_worker_context(conn, tid)
+
+        review_claim = kb.claim_review_task(conn, tid)
+        assert review_claim is not None
+        context = kb.build_worker_context(conn, tid)
+    assert "review lane" in context
+    assert "Status:   running (review lane" in context
