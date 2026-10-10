@@ -124,13 +124,25 @@ def _profile_author(default: str = "specifier") -> str:
 
 
 def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
-    """``(task, "")`` when the task exists and is in triage, else ``(None, reason)``."""
+    """``(task, "")`` when the task exists, is in triage and is NOT parked by
+    the unblock-loop breaker, else ``(None, reason)``.
+
+    The park check lives here — the one reader both ``specify_task`` and
+    ``decompose_task`` call BEFORE spending an aux LLM call — so a card the
+    breaker parked for a human costs one SELECT per tick instead of a full
+    aux round-trip plus (on the single-task path) a resurrection back into
+    dispatch. The DB layer refuses independently; this is what makes the
+    refusal visible instead of silent.
+    """
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        parked = None if task is None else kb.triage_park_reason(conn, task_id)
     if task is None:
         return None, "unknown task id"
     if task.status != "triage":
         return None, f"task is not in triage (status={task.status!r})"
+    if parked:
+        return None, parked
     return task, ""
 
 
@@ -221,13 +233,19 @@ def specify_task(
             return SpecifyOutcome(task_id, False, "LLM response missing title and body")
 
     with kbc.connect_closing() as conn:
-        ok = kb.specify_triage_task(
+        parked = kb.triage_park_reason(conn, task_id)
+        ok = False if parked else kb.specify_triage_task(
             conn,
             task_id,
             title=new_title,
             body=new_body,
             author=author or _profile_author(),
         )
+    if parked:
+        # Breaker-parked card: the aux call above is wasted but harmless, and
+        # the card stays in triage for a human. Say WHY instead of reporting
+        # the generic race message.
+        return SpecifyOutcome(task_id, False, parked)
     if not ok:
         # Race: promoted/archived between our read and the write.
         return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")

@@ -136,6 +136,56 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_review_lane_gets_review_verdict_prompt(monkeypatch, tmp_path):
+    """A review-lane claim must spawn the reviewer prompt, never the
+    implementer ``work kanban task`` prompt.
+
+    Regression (rentcli t_ae858313, runs 708-711): an implementer-owned card
+    in ``review`` was claimed by the review lane and then spawned with the
+    implementer queue prompt — the worker re-read already-done work as a new
+    implementation job, exited without a reviewer verdict, and crash-looped
+    to ``gave_up``. The queue prompt is the worker's only role signal before
+    ``kanban_show``, so the review lane must ask for exactly one verdict.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "developer").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli._parser import build_top_level_parser
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="developer")
+    task.dispatch_lane = "review"
+    kbd._default_spawn(task, str(workspace))
+
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    args = parser.parse_args(captured["cmd"][3:])
+
+    assert args.command == "chat"
+    assert args.query == (
+        "review kanban task t_spawn_tools: verify the implementer's handoff "
+        "(kanban_show), then give exactly one verdict — kanban_complete "
+        "(approve), kanban_request_changes (rework), or kanban_block (escalate)"
+    )
+    assert "work kanban task" not in args.query
+
+
 def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp_path):
     """Under multiplex a worker spawn with ``terminal.env_passthrough`` configured must
     forward the ASSIGNEE profile's own value, never crash on an unscoped read or leak the

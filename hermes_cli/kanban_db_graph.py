@@ -101,6 +101,7 @@ def decompose_triage_task(
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
+        _parked_by_block_loop, _row_get,
         write_txn, recompute_ready,
     )
 
@@ -115,10 +116,18 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
+            return None
+        # The unblock-loop breaker parked this card FOR A HUMAN. Fan-out would
+        # resurrect it (root triage -> todo, fresh children) every tick and
+        # defeat BLOCK_RECURRENCE_LIMIT exactly as the single-task promotion
+        # path did (t_5ca79764). Refuse before ANY child is inserted.
+        if _parked_by_block_loop(
+            _row_get(root_row, "block_kind"), _row_get(root_row, "block_recurrences"),
+        ):
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.

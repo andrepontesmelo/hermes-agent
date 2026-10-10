@@ -97,6 +97,29 @@ def test_specify_task_happy_path(kanban_home):
 
 
 
+def test_specify_task_reports_block_loop_park_without_calling_the_llm(kanban_home):
+    """AC2: the refusal is a user-visible reason, and a parked card costs no aux
+    LLM call. The card must stay in triage (AC1)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs a human", triage=True)
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'capability', block_recurrences = ? WHERE id = ?",
+            (kb.BLOCK_RECURRENCE_LIMIT, tid),
+        )
+
+    p, mock_fn = _patch_aux_client(jsonlib.dumps({"title": "x", "body": "y"}))
+    with p:
+        outcome = spec.specify_task(tid, author="auto-decomposer")
+
+    assert outcome.ok is False
+    assert "block-loop detection" in outcome.reason
+    assert "awaiting human" in outcome.reason
+    assert "moved out of triage" not in outcome.reason, "must not report a phantom race"
+    mock_fn.assert_not_called()
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring — argparse + _cmd_specify
 # ---------------------------------------------------------------------------

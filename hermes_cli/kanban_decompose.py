@@ -229,9 +229,14 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     if title_val is None and body_val is None:
         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
     with kbc.connect_closing() as conn:
-        ok = kb.specify_triage_task(
+        parked = kb.triage_park_reason(conn, task.id)
+        ok = False if parked else kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
         )
+    if parked:
+        # Breaker-parked card (kanban_db._parked_by_block_loop): leave it in
+        # triage for a human and say so, rather than reporting the generic race.
+        return DecomposeOutcome(task.id, False, parked)
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
@@ -294,6 +299,12 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
+        # Either already decomposed / moved out of triage, or breaker-parked
+        # for a human — report which so the refusal is never silent.
+        with kbc.connect_closing() as conn:
+            parked = kb.triage_park_reason(conn, task_id)
+        if parked:
+            return DecomposeOutcome(task_id, False, parked)
         return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
