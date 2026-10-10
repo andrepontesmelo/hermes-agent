@@ -8,6 +8,7 @@ helpers ``_origin`` / ``_section`` / ``_remove_quietly``.
 
 from __future__ import annotations
 
+import array
 import logging
 import os
 import re
@@ -15,6 +16,7 @@ import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -242,6 +244,55 @@ def _finalize_wav_output(wav_path: str, output_path: str) -> str:
                 check=True, capture=False)
     _remove_quietly(wav_path)
     return output_path
+
+
+def _trim_gemini_tail_noise(
+    pcm_bytes: bytes, sample_rate: int = GEMINI_TTS_SAMPLE_RATE,
+    channels: int = GEMINI_TTS_CHANNELS, sample_width: int = GEMINI_TTS_SAMPLE_WIDTH,
+) -> bytes:
+    """Strip the ~130 ms clipped-noise tail Gemini TTS appends to every response.
+
+    Port of the proven clip-anchor trim from the tts-voice skill (scripts/tts_trim.py,
+    2026-10-07): anchor on the LAST sample pinned near full scale (|x| >= 32000 in 16-bit
+    PCM) within the final second, walk back through the contiguous artifact block stopping
+    at the first 40 ms quiet gap (|x| <= 2000), keep a 30 ms pad and apply a 10 ms fade-out.
+    Clean audio (no pinned tail) returns the input bytes object unchanged. A trailing
+    partial frame is dropped. Gemini-specific defect: only the Gemini generator calls this.
+    """
+    frame = channels * sample_width
+    n_frames = len(pcm_bytes) // frame
+    if n_frames == 0:
+        return pcm_bytes
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[: n_frames * frame])
+    swapped = sys.byteorder == "big"
+    if swapped:
+        samples.byteswap()  # Gemini PCM is signed little-endian
+    last_clip = None
+    for j in range(n_frames - 1, max(0, n_frames - sample_rate), -1):
+        if abs(samples[j]) >= 32000:
+            last_clip = j
+            break
+    trimmed = None
+    if last_clip is not None:
+        quiet, start = 0, last_clip
+        for j in range(last_clip, -1, -1):
+            if abs(samples[j]) > 2000:
+                start, quiet = j, 0
+            else:
+                quiet += 1
+                if quiet >= sample_rate * 0.04:
+                    break
+        cut = max(0, start - int(sample_rate * 0.03))
+        trimmed = samples[:cut]
+        fade = int(sample_rate * 0.01)
+        for k in range(min(fade, len(trimmed))):
+            trimmed[-1 - k] = int(trimmed[-1 - k] * (k / fade))
+    if trimmed is None:
+        return pcm_bytes
+    if swapped:
+        trimmed.byteswap()
+    return trimmed.tobytes()
 
 
 def _wrap_pcm_as_wav(

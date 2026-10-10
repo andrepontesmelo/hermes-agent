@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-from tools.tts_tool_delivery import _origin, _section, _wrap_pcm_as_wav, _write_wav_bytes_as
+from tools.tts_tool_delivery import (
+    _origin, _section, _trim_gemini_tail_noise, _wrap_pcm_as_wav, _write_wav_bytes_as)
 from tools.xai_http import hermes_xai_user_agent
 
 logger = logging.getLogger("tools.tts_tool")
@@ -614,4 +615,8 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]
         raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
     if not audio_b64:
         raise RuntimeError("Gemini TTS returned empty audio data")
-    return _write_wav_bytes_as(_wrap_pcm_as_wav(base64.b64decode(audio_b64)), output_path)
+    # Gemini appends ~130 ms of full-scale clipped noise to every response; trim it before
+    # the WAV wrap so the artifact never reaches any container. Proven clip-anchor logic
+    # ported from the tts-voice skill; other providers never hit this code.
+    pcm = _trim_gemini_tail_noise(base64.b64decode(audio_b64))
+    return _write_wav_bytes_as(_wrap_pcm_as_wav(pcm), output_path)
